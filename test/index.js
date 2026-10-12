@@ -201,3 +201,175 @@ t.test('single sequence max', async t => {
     `Expected time (${timeTaken}ms) to be less than 500ms`,
   )
 })
+
+// CVE-2026-14257: `max` caps the number of results but not their length, so
+// chaining many brace groups keeps the count under `max` while each result
+// grows with the number of groups. Building 100k long results (and the
+// intermediate arrays combined along the way) exhausted memory and crashed
+// the process with an uncatchable out-of-memory error.
+t.test('total expansion length is bounded', async t => {
+  const str = '{a,b}'.repeat(1500)
+  const startTime = performance.now()
+  const expanded = expand(str)
+  const endTime = performance.now()
+
+  const totalLength = expanded.reduce((sum, s) => sum + s.length, 0)
+  t.ok(
+    totalLength <= 4_000_000,
+    `Expected total length (${totalLength}) to be bounded`,
+  )
+  t.ok(expanded.length > 0, 'still returns a (truncated) result')
+  t.ok(
+    expanded.every(s => /^[ab]+$/.test(s)),
+    'results are valid expansions',
+  )
+  t.ok(
+    endTime - startTime < 5000,
+    `Expected time (${endTime - startTime}ms) to be less than 5000ms`,
+  )
+
+  // The bound is a single accumulator, not a per-level limit, so it holds no
+  // matter how many brace groups are chained - not `groups * maxLength`.
+  for (const groups of [100, 1500, 5000]) {
+    const total = expand('{a,b}'.repeat(groups)).reduce(
+      (sum, s) => sum + s.length,
+      0,
+    )
+    t.ok(
+      total <= 4_000_000,
+      `Expected total length (${total}) to stay bounded at ${groups} groups`,
+    )
+  }
+})
+
+// Expanding the tail iteratively (rather than recursing once per brace group)
+// keeps native stack depth constant, so deeply chained input that used to throw
+// `RangeError: Maximum call stack size exceeded` around ~2,700 groups now
+// returns a bounded result.
+t.test('deep chaining does not overflow the stack', async t => {
+  const str = '{a,b}'.repeat(50_000)
+  t.doesNotThrow(() => {
+    const expanded = expand(str)
+    t.ok(expanded.length > 0, 'still returns a (truncated) result')
+    t.ok(
+      expanded.reduce((sum, s) => sum + s.length, 0) <= 4_000_000,
+      'output stays bounded',
+    )
+  })
+})
+
+t.test('maxLength option bounds output size', async t => {
+  const str = '{a,b}'.repeat(1500)
+  const expanded = expand(str, { maxLength: 100_000 })
+  const totalLength = expanded.reduce((sum, s) => sum + s.length, 0)
+  t.ok(
+    totalLength <= 100_000,
+    `Expected total length (${totalLength}) to respect maxLength`,
+  )
+
+  // The `${...}` literal branch combines its body with the expanded tail and
+  // must be bounded the same way.
+  const dollar = '${x}' + '{a,b}'.repeat(20)
+  const expandedDollar = expand(dollar, { maxLength: 100_000 })
+  const dollarLength = expandedDollar.reduce((sum, s) => sum + s.length, 0)
+  t.ok(
+    dollarLength <= 100_000,
+    `Expected total length (${dollarLength}) to respect maxLength`,
+  )
+})
+
+// Bypass of CVE-2026-14257's mitigation: each comma-separated alternative
+// (`{alt,alt,...}`) is expanded independently, and `maxLength` only bounded
+// each alternative's own output, not the running total accumulated across
+// all of them. Many alternatives - each individually far under `maxLength` -
+// could still sum to an unbounded intermediate array before the final
+// `combine` call ever got a chance to truncate.
+t.test('total length across comma alternatives is bounded', async t => {
+  const alt = '{1..5}'
+  const str = '{' + Array(1000).fill(alt).join(',') + '}'
+  const startTime = performance.now()
+  const expanded = expand(str, { maxLength: 50 })
+  const endTime = performance.now()
+
+  const totalLength = expanded.reduce((sum, s) => sum + s.length, 0)
+  t.ok(
+    totalLength <= 50,
+    `Expected total length (${totalLength}) to respect maxLength`,
+  )
+  t.ok(expanded.length > 0, 'still returns a (truncated) result')
+  t.ok(
+    endTime - startTime < 500,
+    `Expected time (${endTime - startTime}ms) to be less than 500ms`,
+  )
+
+  // Regression case from the report: 400 alternatives, each individually
+  // bounded by maxLength but unbounded in aggregate before the fix.
+  const part = '{' + '0'.repeat(50) + '1..100000}'
+  const bigStr = '{' + Array(400).fill(part).join(',') + '}'
+  t.doesNotThrow(() => {
+    const bigExpanded = expand(bigStr)
+    const bigTotal = bigExpanded.reduce((sum, s) => sum + s.length, 0)
+    t.ok(
+      bigTotal <= 4_000_000,
+      `Expected total length (${bigTotal}) to stay bounded`,
+    )
+  })
+})
+
+// A padded sequence's element width follows the input, so generating all `max`
+// elements before `combine` could discard them cost time proportional to
+// `max * width` - a ~400KB input blocked the event loop for over two minutes.
+t.test('padded sequences respect maxLength while generating', async t => {
+  const str = '{' + '0'.repeat(400_000) + '1..100000}'
+  const startTime = performance.now()
+  const expanded = expand(str)
+  const elapsed = performance.now() - startTime
+
+  const totalLength = expanded.reduce((sum, s) => sum + s.length, 0)
+  t.ok(
+    totalLength <= 4_000_000,
+    `Expected total length (${totalLength}) to stay bounded`,
+  )
+  t.ok(expanded.length > 0, 'still returns a (truncated) result')
+  t.ok(
+    elapsed < 2000,
+    `Expected time (${elapsed}ms) to be less than 2000ms`,
+  )
+
+  // Truncating early must not change results that fit within the bound.
+  t.same(
+    expand('{01..10}'),
+    ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10'],
+    'padded sequences under the bound are unaffected',
+  )
+})
+
+// Bounding the intermediate `values` array must not change what `max` counts:
+// alternatives that expand to nothing are dropped by `combine`, so they cost a
+// slot in `values` but never a result.
+t.test('max bounds the number of kept results', async t => {
+  t.same(
+    expand('{a,,b}', { max: 2 }),
+    ['a', 'b'],
+    'dropped empty alternatives do not count against max',
+  )
+  t.same(
+    expand('{a,,,b,c}', { max: 3 }),
+    ['a', 'b', 'c'],
+    'consecutive empty alternatives do not count against max',
+  )
+  // Here the empties survive as `xy`, so they are results and do count.
+  t.same(
+    expand('x{a,,b}y', { max: 2 }),
+    ['xay', 'xy'],
+    'kept empty alternatives still count against max',
+  )
+  // The accumulator is mixed here - `{a,}` contributes both 'a' and '' - so
+  // the empty alternative cannot be skipped up front, and `combine` drops
+  // the one combination that ends up empty instead.
+  t.strictSame(
+    expand('{a,}{b,}'),
+    ['ab', 'a', 'b'],
+    'empty combinations are dropped from a mixed accumulator',
+  )
+})
