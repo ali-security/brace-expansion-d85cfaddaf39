@@ -40,6 +40,30 @@ export const EXPANSION_MAX_LENGTH = 4_000_000
 // the depth at which the stack runs out.
 export const EXPANSION_MAX_DEPTH = 1_000
 
+// Bash keeps a quirk where a brace group followed by a comma set still expands
+// (`{a},b}`). The parser implements it by rewriting the string and restarting
+// the scan, absorbing one `}` per pass. `n` trailing braces therefore cost `n`
+// full passes over a string that itself grows by one `escClose` sentinel each
+// time - quadratic in `n`, with a ~26x constant from the sentinel's length.
+// 128KB of `'{a}' + '}'.repeat(n) + ',z}'` blocked the event loop for 27
+// seconds to produce two results. `EXPANSION_MAX_REWRITES` bounds how many
+// times the scan may restart. Real `{a},b}` input needs a handful.
+//
+// The bound has to cover the whole expansion, not one `expand_` call: every
+// nested set and every comma member is expanded by its own recursive call, and
+// a budget that reset for each of them let nesting the shape (or repeating it
+// across a comma set) multiply the passes right back. It also has to count the
+// work rather than the passes, since a pass rescans every brace left in the
+// string: `'x' + '{}'.repeat(32_000) + '{y,z}'` (64KB) still blocked for ~7
+// seconds within 1,000 passes. So a pass over a string longer than
+// `REWRITE_UNIT` characters counts as one rewrite per `REWRITE_UNIT`.
+export const EXPANSION_MAX_REWRITES = 1_000
+const REWRITE_UNIT = 4_096
+
+// The rewrites one `expand` call has left. Shared by reference between every
+// `expand_` it recurses into.
+type RewriteBudget = { left: number }
+
 function numeric(str: string) {
   return !isNaN(str as any) ? parseInt(str, 10) : str.charCodeAt(0)
 }
@@ -115,6 +139,7 @@ export type BraceExpansionOptions = {
   max?: number
   maxLength?: number
   maxDepth?: number
+  maxRewrites?: number
 }
 
 export function expand(str: string, options: BraceExpansionOptions = {}) {
@@ -126,6 +151,7 @@ export function expand(str: string, options: BraceExpansionOptions = {}) {
     max = EXPANSION_MAX,
     maxLength = EXPANSION_MAX_LENGTH,
     maxDepth = EXPANSION_MAX_DEPTH,
+    maxRewrites = EXPANSION_MAX_REWRITES,
   } = options
 
   // I don't know why Bash 4.3 does this, but it does.
@@ -138,9 +164,15 @@ export function expand(str: string, options: BraceExpansionOptions = {}) {
     str = '\\{\\}' + str.slice(2)
   }
 
-  return expand_(escapeBraces(str), max, maxLength, maxDepth, 0, true).map(
-    unescapeBraces,
-  )
+  return expand_(
+    escapeBraces(str),
+    max,
+    maxLength,
+    maxDepth,
+    0,
+    { left: maxRewrites },
+    true,
+  ).map(unescapeBraces)
 }
 
 function embrace(str: string) {
@@ -256,6 +288,7 @@ function expand_(
   maxLength: number,
   maxDepth: number,
   depth: number,
+  rewrites: RewriteBudget,
   isTop: boolean,
 ): string[] {
   // Too deeply nested to keep following: treat the rest as literal, the same
@@ -314,7 +347,10 @@ function expand_(
     const isOptions = m.body.indexOf(',') >= 0
     if (!isSequence && !isOptions) {
       // {a},b}
-      if (m.post.match(/,(?!,).*\}/)) {
+      // Each pass restarts the scan and re-reads the whole string, so leaving
+      // this unbounded is quadratic. Charge the pass by the length it rescans.
+      if (rewrites.left > 0 && m.post.match(/,(?!,).*\}/)) {
+        rewrites.left -= Math.ceil(str.length / REWRITE_UNIT)
         str = m.pre + '{' + m.body + escClose + m.post
         isTop = true
         continue
@@ -342,9 +378,15 @@ function expand_(
       let n = parseCommaParts(m.body)
       if (n.length === 1 && n[0] !== undefined) {
         // x{{a,b}}y ==> x{a}y x{b}y
-        n = expand_(n[0], max, maxLength, maxDepth, depth + 1, false).map(
-          embrace,
-        )
+        n = expand_(
+          n[0],
+          max,
+          maxLength,
+          maxDepth,
+          depth + 1,
+          rewrites,
+          false,
+        ).map(embrace)
         //XXX is this necessary? Can't seem to hit it in tests.
         /* c8 ignore start */
         if (n.length === 1) {
@@ -384,6 +426,7 @@ function expand_(
           maxLength,
           maxDepth,
           depth + 1,
+          rewrites,
           false,
         )
         for (let k = 0; k < expanded.length; k++) {

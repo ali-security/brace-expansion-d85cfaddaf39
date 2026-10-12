@@ -350,6 +350,132 @@ t.test('a large comma set does not overflow the stack', async t => {
   })
 })
 
+// Bash keeps a quirk where a brace group followed by a comma set still expands
+// (`{a},b}`). The parser rewrites the string and restarts the scan, absorbing
+// one `}` per pass, so `n` trailing braces cost `n` passes over a string that
+// itself grows by one `escClose` sentinel each time - quadratic in `n`. 128KB
+// of this shape blocked the event loop for 27 seconds to produce 2 results.
+t.test('the {a},b} rewrite does not run in quadratic time', async t => {
+  const build = n => '{a}' + '}'.repeat(n) + ',z}'
+
+  const startTime = performance.now()
+  expand(build(128_000))
+  const elapsed = performance.now() - startTime
+  t.ok(
+    elapsed < 2000,
+    `Expected time (${elapsed}ms) to be less than 2000ms`,
+  )
+
+  // Neither output bound applies: the payload yields a couple of results at any
+  // size, so the cost is all in parsing.
+  t.doesNotThrow(() => expand(build(128_000), { max: 1, maxLength: 1 }))
+})
+
+t.test('maxRewrites option bounds the rescan count', async t => {
+  const build = n => '{a}' + '}'.repeat(n) + ',z}'
+
+  // Real `{a},b}` input needs a handful of passes, and is untouched.
+  t.strictSame(expand('{a},b}'), ['a}', 'b'])
+  t.strictSame(expand('a{},b}c'), ['a}c', 'abc'])
+  t.strictSame(expand('{a},b}', { maxRewrites: 1000 }), expand('{a},b}'))
+
+  // Below the bound the result matches an unbounded expansion exactly.
+  for (const n of [1, 10, 100]) {
+    t.strictSame(
+      expand(build(n), { maxRewrites: 1000 }),
+      expand(build(n), { maxRewrites: 100_000 }),
+      `${n} trailing braces are unchanged below the bound`,
+    )
+  }
+
+  // Past it the scan stops restarting and the rest stays literal, rather than
+  // throwing - the same way `max` and `maxLength` truncate.
+  t.strictSame(expand('{a},b}', { maxRewrites: 0 }), ['{a},b}'])
+  t.ok(
+    expand(build(50), { maxRewrites: 10 })[0].startsWith('{a}'),
+    'past the bound the group comes back literal',
+  )
+})
+
+// The bound must hold for the whole expansion, not per recursive call. Each
+// level of nesting and each comma member is expanded by its own `expand_`, and
+// every rewrite pass rescans the whole string at that level - nested content
+// included. A budget that reset for each of them let 64KB of nested `{a},b}`
+// shapes block the event loop for over 100 seconds despite the bound.
+const nestRewrites = (k, depth) => {
+  let str = 'q'
+  for (let i = 0; i < depth; i++) {
+    str = '{}'.repeat(k) + '{' + str + ',q}'
+  }
+  return 'x' + str
+}
+
+t.test('nested {a},b} rewrites do not run in quadratic time', async t => {
+  for (const [k, depth] of [
+    [1000, 32],
+    [32, 940],
+  ]) {
+    const str = nestRewrites(k, depth)
+    const startTime = performance.now()
+    expand(str)
+    const elapsed = performance.now() - startTime
+    t.ok(
+      elapsed < 2000,
+      `Expected time (${elapsed}ms) for ${depth} levels of ${k} rewrites to be less than 2000ms`,
+    )
+  }
+})
+
+// When the leading group does not close on the next `}`, every pass walks
+// every brace left in the string, so 1,000 passes over a long one are still
+// far too many: 64KB of either shape blocked for ~2-7 seconds with only the
+// number of passes bounded.
+t.test('brace-dense {a},b} rewrites do not run in quadratic time', async t => {
+  const member = '{}'.repeat(1000) + '{y,z}'
+  for (const [name, str] of [
+    ['one set', 'x' + '{}'.repeat(64_000) + '{y,z}'],
+    ['a comma set', '{' + new Array(64).fill(member).join(',') + '}'],
+  ]) {
+    const startTime = performance.now()
+    expand(str)
+    const elapsed = performance.now() - startTime
+    t.ok(
+      elapsed < 2000,
+      `Expected time (${elapsed}ms) for ${name} of ${str.length} chars to be less than 2000ms`,
+    )
+  }
+})
+
+t.test('the rewrite budget is shared by the whole expansion', async t => {
+  // Nested sets: two rewrites at each of three levels, six along the path.
+  const nested = nestRewrites(2, 3)
+  const unbounded = expand(nested, { maxRewrites: 100_000 })
+  t.strictSame(expand(nested, { maxRewrites: 6 }), unbounded)
+  // One short and the innermost set comes back literal.
+  const bounded = expand(nested, { maxRewrites: 5 })
+  t.notSame(bounded, unbounded)
+  t.ok(
+    bounded.some(s => s.endsWith('{q,q}')),
+    'past the bound the innermost group comes back literal',
+  )
+
+  // Comma members: one rewrite each, drawn from the same budget.
+  const wide = '{{}{y,z},{}{y,z}}'
+  t.strictSame(expand(wide), ['{}y', '{}z', '{}y', '{}z'])
+  t.strictSame(expand(wide, { maxRewrites: 2 }), expand(wide))
+  t.strictSame(expand(wide, { maxRewrites: 1 }), ['{}y', '{}z', '{}{y,z}'])
+
+  // A pass over a long string counts as more than one rewrite.
+  t.strictSame(expand('p{}{}{y,z}', { maxRewrites: 2 }), [
+    'p{}{}y',
+    'p{}{}z',
+  ])
+  const pad = 'p'.repeat(100_000)
+  t.strictSame(expand(pad + '{}{}{y,z}', { maxRewrites: 2 }), [
+    pad + '{}{}{y,z}',
+  ])
+})
+
 t.test('maxLength option bounds output size', async t => {
   const str = '{a,b}'.repeat(1500)
   const expanded = expand(str, { maxLength: 100_000 })
